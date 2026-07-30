@@ -1,21 +1,18 @@
-// Import the functions you need from the SDKs you need
-import { initializeApp } from "firebase/app";
-import { getAnalytics } from "firebase/analytics";
-// TODO: Add SDKs for Firebase products that you want to use
-// https://firebase.google.com/docs/web/setup#available-libraries
-
-// Your web app's Firebase configuration
-// For Firebase JS SDK v7.20.0 and later, measurementId is optional
-const firebaseConfig = {
+// ============================================================
+//  Configuración de tu proyecto de Firebase (ya con tus claves reales)
+// ============================================================
+export const firebaseConfig = {
   apiKey: "AIzaSyAplDbDn4DdEZ_8_iE7ZJ32DjCApJNWoMg",
   authDomain: "gastos-casa-44fa4.firebaseapp.com",
   projectId: "gastos-casa-44fa4",
   storageBucket: "gastos-casa-44fa4.firebasestorage.app",
   messagingSenderId: "595765425801",
-  appId: "1:595765425801:web:61dfe1ade1fa8d0c22b858",
-  measurementId: "G-K2GH1D9Q9G"
+  appId: "1:595765425801:web:61dfe1ade1fa8d0c22b858"
 };
 
-// Initialize Firebase
-const app = initializeApp(firebaseConfig);
-const analytics = getAnalytics(app);
+// Estas claves son públicas por diseño: no son secretas y no protegen nada por sí solas.
+// Quien protege los datos son las reglas de Firestore (archivo firestore.rules).
+//
+// Nota: no incluimos measurementId ni Google Analytics a propósito. Esta app no los usa,
+// y agregarlos requeriría otro import que no está preparado en app.js. Si algún día
+// quieres estadísticas de uso con Analytics, dímelo y lo agregamos correctamente.
