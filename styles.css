@@ -157,6 +157,46 @@ textarea.input{min-height:88px;font-family:'IBM Plex Mono',monospace;font-size:1
 .detalle-titulo{font-weight:600;font-size:1.05rem;margin:.5rem 0 .1rem;}
 .detalle-monto{font-family:'Fraunces',Georgia,serif;font-size:1.6rem;font-weight:600;margin:0 0 .75rem;}
 
+/* ---------- buscador de gastos ---------- */
+.buscador{position:relative;margin-bottom:.7rem;}
+.buscador-ico{position:absolute;left:.75rem;top:50%;transform:translateY(-50%);font-size:14px;
+  opacity:.55;pointer-events:none;}
+.buscador input{padding-left:2.1rem;padding-right:2.1rem;}
+.buscador-limpiar{position:absolute;right:.5rem;top:50%;transform:translateY(-50%);
+  width:26px;height:26px;border-radius:50%;border:none;background:var(--card-alt);
+  color:var(--ink-soft);display:flex;align-items:center;justify-content:center;
+  font-size:13px;cursor:pointer;}
+.buscador-limpiar:hover{background:var(--line);}
+
+/* ---------- fotos de facturas ---------- */
+.foto-picker{display:flex;align-items:center;justify-content:center;gap:.45rem;width:100%;
+  border:1.5px dashed var(--line);background:var(--card);border-radius:11px;padding:.85rem;
+  font-family:'Work Sans',sans-serif;font-weight:600;font-size:.85rem;color:var(--ink-soft);cursor:pointer;}
+.foto-picker:hover{border-color:var(--ink-faint);background:var(--card-alt);}
+.foto-hint{margin:.35rem 0 0;font-size:.72rem;color:var(--ink-faint);line-height:1.35;}
+.foto-trabajando{display:flex;align-items:center;justify-content:center;gap:.5rem;padding:1rem;
+  font-size:.84rem;color:var(--ink-soft);border:1px dashed var(--line);border-radius:11px;}
+.foto-preview{position:relative;border-radius:12px;overflow:hidden;border:1px solid var(--line);background:var(--card-alt);}
+.foto-preview img{display:block;width:100%;max-height:190px;object-fit:cover;}
+.foto-quitar{position:absolute;top:8px;right:8px;width:32px;height:32px;border-radius:50%;border:none;
+  background:rgba(34,48,43,.78);color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:15px;}
+.foto-quitar:hover{background:var(--ink);}
+.mov-clip{flex-shrink:0;font-size:14px;line-height:1;margin-left:-.25rem;opacity:.7;}
+
+.detalle-foto{margin:0 0 1.1rem;}
+.detalle-foto button{display:block;width:100%;padding:0;border:1px solid var(--line);border-radius:12px;
+  overflow:hidden;background:var(--card-alt);cursor:zoom-in;}
+.detalle-foto img{display:block;width:100%;max-height:230px;object-fit:cover;}
+.detalle-foto p{margin:.35rem 0 0;font-size:.72rem;color:var(--ink-faint);text-align:center;}
+
+.visor{position:fixed;inset:0;z-index:80;background:rgba(20,28,25,.94);display:flex;
+  align-items:center;justify-content:center;padding:1rem;cursor:zoom-out;}
+.visor img{max-width:100%;max-height:88vh;object-fit:contain;border-radius:8px;}
+.visor-cerrar{position:absolute;top:1rem;right:1rem;width:42px;height:42px;border-radius:50%;border:none;
+  background:rgba(255,255,255,.16);color:#fff;display:flex;align-items:center;justify-content:center;
+  cursor:pointer;font-size:18px;}
+.visor-cerrar:hover{background:rgba(255,255,255,.28);}
+
 /* ---------- navegación ---------- */
 nav.tabs{position:sticky;bottom:0;display:flex;background:var(--bg);border-top:1px solid var(--line);
   padding:.5rem .75rem calc(.5rem + env(safe-area-inset-bottom));}
