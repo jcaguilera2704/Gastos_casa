@@ -6,7 +6,7 @@ import {
 } from 'https://www.gstatic.com/firebasejs/12.15.0/firebase-auth.js';
 import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
-  collection, doc, setDoc, deleteDoc, onSnapshot, writeBatch
+  collection, doc, setDoc, deleteDoc, getDoc, onSnapshot, writeBatch
 } from 'https://www.gstatic.com/firebasejs/12.15.0/firebase-firestore.js';
 import { firebaseConfig } from './firebase-config.js';
 
@@ -61,6 +61,50 @@ const nuevoId = () => Date.now().toString(36) + Math.random().toString(36).slice
 const esc = (s) => String(s === null || s === undefined ? '' : s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
+// Para que buscar "cafe" también encuentre "Café": pasa a minúsculas y quita tildes.
+const normalizar = (s) => String(s || '')
+  .toLowerCase()
+  .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+// Las fotos viven en su propia colección, no dentro de "movimientos": así la lista de
+// gastos sigue sincronizando liviano y una foto solo se descarga cuando se abre ese gasto.
+const recibo = (id) => doc(db, 'recibos', id);
+
+// Un documento de Firestore no puede pasar de 1 MB. Dejamos harto margen debajo de eso.
+const MAX_FOTO_CHARS = 700000;
+
+function comprimirImagen(archivo, maxDim = 1400) {
+  return new Promise((resolve, reject) => {
+    const lector = new FileReader();
+    lector.onerror = () => reject(new Error('lectura'));
+    lector.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('decodificacion'));
+      img.onload = () => {
+        const escala = Math.min(1, maxDim / Math.max(img.width, img.height));
+        const w = Math.max(1, Math.round(img.width * escala));
+        const h = Math.max(1, Math.round(img.height * escala));
+        const lienzo = document.createElement('canvas');
+        lienzo.width = w; lienzo.height = h;
+        const ctx = lienzo.getContext('2d');
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(img, 0, 0, w, h);
+        let calidad = 0.62;
+        let salida = lienzo.toDataURL('image/jpeg', calidad);
+        while (salida.length > MAX_FOTO_CHARS && calidad > 0.25) {
+          calidad -= 0.1;
+          salida = lienzo.toDataURL('image/jpeg', calidad);
+        }
+        if (salida.length > MAX_FOTO_CHARS) return reject(new Error('muy-pesada'));
+        resolve(salida);
+      };
+      img.src = lector.result;
+    };
+    lector.readAsDataURL(archivo);
+  });
+}
+
 /* ============================================================
    Estado
    ============================================================ */
@@ -71,9 +115,11 @@ const estado = {
   cargando: true,
   vista: 'resumen',
   filtroCat: 'todos',
+  busqueda: '',
   periodo: 'mes',
   visibles: 50,
   aviso: null,
+  fotos: {}, // cache en memoria: id de movimiento -> foto ya descargada de Firestore
 };
 
 let desuscribir = [];
@@ -149,7 +195,14 @@ function escucharDatos() {
   desuscribir.push(onSnapshot(movimientosRef, (snap) => {
     estado.movimientos = snap.docs.map(d => ({ id: d.id, ...d.data() }));
     estado.cargando = false;
-    render();
+    // Si en ese momento está escribiendo en el buscador, no reconstruimos toda la
+    // pantalla (le quitaría el foco a mitad de la escritura) — solo refrescamos
+    // la lista de resultados con los datos nuevos.
+    if (document.activeElement && document.activeElement.id === 'g-busqueda') {
+      refrescarListaGastos();
+    } else {
+      render();
+    }
   }, (e) => {
     estado.cargando = false;
     avisar(e.code === 'permission-denied'
@@ -167,7 +220,19 @@ function escucharDatos() {
   }, () => {}));
 }
 
-async function guardarMovimiento(mov) {
+// Si mov trae una foto (dataURL ya comprimida), primero se guarda en la colección
+// "recibos" y solo si eso funciona se marca tieneFoto en el movimiento. Así nunca queda
+// un movimiento que diga tener foto sin que la foto realmente se haya guardado.
+async function guardarMovimiento(mov, foto) {
+  if (foto) {
+    try {
+      await setDoc(recibo(mov.id), { data: foto });
+      estado.fotos[mov.id] = foto;
+    } catch (e) {
+      mov = { ...mov, tieneFoto: false };
+      avisar('El gasto se guardó, pero la foto no se pudo subir.', 'error');
+    }
+  }
   try {
     await setDoc(doc(db, 'movimientos', mov.id), mov);
   } catch (e) {
@@ -175,12 +240,28 @@ async function guardarMovimiento(mov) {
   }
 }
 
-async function borrarMovimiento(id) {
+async function borrarMovimiento(id, tieneFoto) {
   try {
     await deleteDoc(doc(db, 'movimientos', id));
   } catch (e) {
     avisar('No se pudo eliminar.', 'error');
+    return;
   }
+  delete estado.fotos[id];
+  if (tieneFoto) {
+    try { await deleteDoc(recibo(id)); } catch (e) { /* ya no existe, no pasa nada */ }
+  }
+}
+
+// Descarga la foto de un movimiento solo cuando hace falta (al abrir su detalle),
+// y la deja en caché para no volver a pedirla si se abre otra vez en esta sesión.
+async function obtenerFoto(id) {
+  if (estado.fotos[id]) return estado.fotos[id];
+  const snap = await getDoc(recibo(id));
+  if (!snap.exists()) throw new Error('no-existe');
+  const data = snap.data().data;
+  estado.fotos[id] = data;
+  return data;
 }
 
 async function guardarNombres(nombres) {
@@ -329,32 +410,65 @@ function fila(m) {
       <span class="mov-titulo">${esc(m.descripcion)}</span>
       <span class="mov-sub">${esc(estado.nombres[m.pagoQuien])} · ${esc(fechaCorta(m.date))} · ${esc(division)}</span>
     </span>
+    ${m.tieneFoto ? '<span class="mov-clip" title="Tiene foto">📷</span>' : ''}
     <span class="mov-monto">${fmt(m.amount)}</span></button></li>`;
 }
 
 /* ---------- gastos ---------- */
-function vistaGastos() {
+function filtrarGastos() {
   let lista = estado.movimientos.filter(m => m.tipo === 'gasto');
   if (estado.filtroCat !== 'todos') lista = lista.filter(m => m.categoria === estado.filtroCat);
+  const q = normalizar(estado.busqueda.trim());
+  if (q) lista = lista.filter(m => normalizar(m.descripcion).includes(q));
   lista.sort((x, y) => y.date.localeCompare(x.date) || (y.orden - x.orden));
+  return lista;
+}
+
+function resultadosGastosHTML() {
+  const hayGastos = estado.movimientos.some(m => m.tipo === 'gasto');
+  const lista = filtrarGastos();
   const visibles = lista.slice(0, estado.visibles);
   const total = lista.reduce((s, m) => s + m.amount, 0);
 
+  if (lista.length === 0) {
+    if (!hayGastos) return vacio();
+    return `<div class="vacio"><p>Ningún gasto coincide con la búsqueda.</p>
+      <button class="btn-link" data-accion="limpiar-filtros">Limpiar filtros →</button></div>`;
+  }
+  return `
+    <p class="conteo">${lista.length} gasto${lista.length === 1 ? '' : 's'} · ${fmt(total)}</p>
+    <ul class="lista">${visibles.map(fila).join('')}</ul>
+    ${estado.visibles < lista.length
+      ? `<button class="btn btn-secundario btn-full" style="margin-top:.9rem" data-accion="mas">
+           Ver más (${lista.length - estado.visibles} restantes)</button>` : ''}`;
+}
+
+// Actualiza solo los resultados (no todo #app), para que el campo de búsqueda
+// nunca se destruya y reconstruya mientras el usuario está escribiendo.
+function refrescarListaGastos() {
+  const zona = document.getElementById('gastos-resultados');
+  if (zona) zona.innerHTML = resultadosGastosHTML();
+}
+
+function vistaGastos() {
   return `
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:.75rem">
       <h2 class="seccion" style="margin:0;font-size:1.25rem">Gastos</h2>
       <button class="btn-icono acento" data-accion="nuevo" aria-label="Agregar gasto">+</button>
     </div>
+    <div class="buscador">
+      <span class="buscador-ico">🔎</span>
+      <input class="input" id="g-busqueda" type="search" inputmode="search"
+        placeholder="Buscar por nombre..." value="${esc(estado.busqueda)}"
+        autocomplete="off" autocorrect="off" autocapitalize="none">
+      <button class="buscador-limpiar" id="g-limpiar" data-accion="limpiar-busqueda"
+        aria-label="Borrar búsqueda" ${estado.busqueda ? '' : 'hidden'}>✕</button>
+    </div>
     <div class="chips">
       <button class="chip ${estado.filtroCat === 'todos' ? 'activo' : ''}" data-cat="todos">Todos</button>
       ${CATEGORIAS.map(c => `<button class="chip ${estado.filtroCat === c.id ? 'activo' : ''}" data-cat="${c.id}">${c.ico} ${esc(c.label)}</button>`).join('')}
     </div>
-    ${lista.length === 0 ? vacio() : `
-      <p class="conteo">${lista.length} gasto${lista.length === 1 ? '' : 's'} · ${fmt(total)}</p>
-      <ul class="lista">${visibles.map(fila).join('')}</ul>
-      ${estado.visibles < lista.length
-        ? `<button class="btn btn-secundario btn-full" style="margin-top:.9rem" data-accion="mas">
-             Ver más (${lista.length - estado.visibles} restantes)</button>` : ''}`}`;
+    <div id="gastos-resultados">${resultadosGastosHTML()}</div>`;
 }
 
 /* ---------- estadísticas ---------- */
@@ -490,6 +604,16 @@ function panelNuevoGasto() {
           <button class="toggle chico" data-d="solo">Solo uno</button>
         </div>
         <div id="g-extra"></div>
+
+        <label class="campo">Foto de la factura (opcional)</label>
+        <div id="g-foto">
+          <label class="foto-picker" id="g-foto-boton">
+            📷 Tomar o elegir foto
+            <input type="file" accept="image/*" id="g-foto-input" hidden>
+          </label>
+          <p class="foto-hint">Se reduce antes de guardarse, así que puede verse menos nítida que el original.</p>
+        </div>
+
         <p class="error" id="g-error" hidden></p>
       </div>
       <div class="panel-foot">
@@ -497,8 +621,53 @@ function panelNuevoGasto() {
       </div>
     </div>`, (nodo) => {
 
-    const sel = { categoria: CATEGORIAS[0].id, pagoQuien: 0, division: 'igual', pctA: 50, soloDe: 0 };
+    const sel = { categoria: CATEGORIAS[0].id, pagoQuien: 0, division: 'igual', pctA: 50, soloDe: 0, foto: null };
     const $ = (s) => nodo.querySelector(s);
+
+    const zonaFoto = $('#g-foto');
+    const pintarFotoVacia = () => {
+      zonaFoto.innerHTML = `
+        <label class="foto-picker" id="g-foto-boton">
+          📷 Tomar o elegir foto
+          <input type="file" accept="image/*" id="g-foto-input" hidden>
+        </label>
+        <p class="foto-hint">Se reduce antes de guardarse, así que puede verse menos nítida que el original.</p>`;
+      zonaFoto.querySelector('#g-foto-input').addEventListener('change', manejarFoto);
+    };
+    const pintarFotoTrabajando = () => {
+      sel.fotoTrabajando = true;
+      zonaFoto.innerHTML = `<div class="foto-trabajando"><span class="spinner-sm"></span> Preparando la foto...</div>`;
+    };
+    const pintarFotoLista = () => {
+      zonaFoto.innerHTML = `
+        <div class="foto-preview">
+          <img src="${sel.foto}" alt="Factura adjunta">
+          <button type="button" class="foto-quitar" id="g-foto-quitar" aria-label="Quitar foto">✕</button>
+        </div>`;
+      zonaFoto.querySelector('#g-foto-quitar').addEventListener('click', () => {
+        sel.foto = null;
+        pintarFotoVacia();
+      });
+    };
+    async function manejarFoto(e) {
+      const archivo = e.target.files && e.target.files[0];
+      if (!archivo) return;
+      pintarFotoTrabajando();
+      try {
+        sel.foto = await comprimirImagen(archivo);
+        sel.fotoTrabajando = false;
+        pintarFotoLista();
+      } catch (err) {
+        sel.fotoTrabajando = false;
+        pintarFotoVacia();
+        const err2 = $('#g-error');
+        err2.textContent = err.message === 'muy-pesada'
+          ? 'La imagen es demasiado pesada. Prueba con otra foto.'
+          : 'No se pudo leer la imagen. Prueba con otro archivo.';
+        err2.hidden = false;
+      }
+    }
+    zonaFoto.querySelector('#g-foto-input').addEventListener('change', manejarFoto);
 
     $('#g-monto').addEventListener('input', (e) => {
       e.target.value = e.target.value.replace(/[^\d]/g, '');
@@ -557,6 +726,7 @@ function panelNuevoGasto() {
       const mostrar = (t) => { err.textContent = t; err.hidden = false; };
       if (!descripcion) return mostrar('Escribe una descripción.');
       if (monto <= 0) return mostrar('Ingresa un monto válido.');
+      if (sel.fotoTrabajando) return mostrar('Espera a que termine de prepararse la foto.');
 
       let parteA, parteB;
       if (sel.division === 'igual') { parteA = Math.round(monto / 2); parteB = monto - parteA; }
@@ -568,10 +738,11 @@ function panelNuevoGasto() {
         descripcion, amount: monto, categoria: sel.categoria, pagoQuien: sel.pagoQuien,
         division: sel.division, soloDe: sel.division === 'solo' ? sel.soloDe : null,
         parteA, parteB, delta: sel.pagoQuien === 0 ? parteB : -parteA,
-        orden: Date.now(),
+        orden: Date.now(), tieneFoto: !!sel.foto,
       };
+      $('#g-guardar').disabled = true;
       cerrarPanel();
-      await guardarMovimiento(mov);
+      await guardarMovimiento(mov, sel.foto);
     });
   });
 }
@@ -651,10 +822,14 @@ function panelDetalle(id) {
       ${cabezaPanel(m.tipo === 'pago' ? 'Detalle del pago' : 'Detalle del gasto')}
       <div class="panel-body">
         ${cuerpo}
+        <div id="d-foto"></div>
         <button class="btn btn-peligro-linea btn-full" id="d-borrar">Eliminar</button>
         <div id="d-confirmar"></div>
       </div>
     </div>`, (nodo) => {
+
+    if (m.tieneFoto) cargarFotoDetalle(nodo, id);
+
     nodo.querySelector('#d-borrar').addEventListener('click', () => {
       nodo.querySelector('#d-borrar').hidden = true;
       const zona = nodo.querySelector('#d-confirmar');
@@ -668,10 +843,35 @@ function panelDetalle(id) {
       });
       zona.querySelector('#d-si').addEventListener('click', async () => {
         cerrarPanel();
-        await borrarMovimiento(id);
+        await borrarMovimiento(id, m.tieneFoto);
       });
     });
   });
+}
+
+async function cargarFotoDetalle(nodo, id) {
+  const zona = nodo.querySelector('#d-foto');
+  zona.innerHTML = `<div class="foto-trabajando"><span class="spinner-sm"></span> Cargando la factura...</div>`;
+  try {
+    const data = await obtenerFoto(id);
+    if (!nodo.isConnected) return; // el panel ya se cerró mientras descargaba
+    zona.innerHTML = `
+      <div class="detalle-foto">
+        <button type="button" id="d-foto-ver"><img src="${data}" alt="Factura del gasto"></button>
+        <p>Toca la imagen para verla completa</p>
+      </div>`;
+    zona.querySelector('#d-foto-ver').addEventListener('click', () => abrirVisor(data));
+  } catch (e) {
+    if (nodo.isConnected) zona.innerHTML = `<p class="foto-hint">La foto de esta factura ya no está disponible.</p>`;
+  }
+}
+
+function abrirVisor(data) {
+  const nodo = document.createElement('div');
+  nodo.className = 'visor';
+  nodo.innerHTML = `<button class="visor-cerrar" aria-label="Cerrar">✕</button><img src="${data}" alt="Factura del gasto">`;
+  nodo.addEventListener('click', () => nodo.remove());
+  document.body.appendChild(nodo);
 }
 
 /* ---------- ajustes ---------- */
@@ -686,7 +886,8 @@ function panelAjustes() {
         <input class="input" id="a-dos" value="${esc(estado.nombres[1])}">
         <button class="btn btn-secundario btn-full" style="margin-top:.9rem" id="a-nombres">Guardar nombres</button>
 
-        <p class="pista">${estado.movimientos.length} movimientos sincronizados.
+        <p class="pista">${estado.movimientos.length} movimientos sincronizados
+          · ${estado.movimientos.filter(m => m.tieneFoto).length} con foto.
           Sesión: ${esc(estado.usuario.email || '')}</p>
 
         <button class="btn btn-secundario btn-full" style="margin-top:.7rem" id="a-copia">Copia de seguridad</button>
@@ -811,7 +1012,8 @@ function panelCopia() {
       ${cabezaPanel('Copia de seguridad')}
       <div class="panel-body">
         <p class="pista" style="margin-top:0">${estado.movimientos.length} movimientos.
-          Firestore ya guarda todo en la nube; esto es por si quieres una copia propia.</p>
+          Firestore ya guarda todo en la nube; esto es por si quieres una copia propia.
+          Las fotos de facturas no van incluidas, solo los datos del gasto.</p>
         <button class="btn btn-principal btn-full" style="margin-top:.7rem" id="c-json">Descargar copia (.json)</button>
         <button class="btn btn-secundario btn-full" style="margin-top:.6rem" id="c-csv">Descargar tabla (.csv)</button>
         <p class="pista">El CSV abre en Excel o Google Sheets.</p>
@@ -868,7 +1070,9 @@ document.addEventListener('click', (e) => {
     if (a === 'nuevo') return panelNuevoGasto();
     if (a === 'saldar') return panelSaldar();
     if (a === 'ajustes') return panelAjustes();
-    if (a === 'mas') { estado.visibles += 50; return render(); }
+    if (a === 'mas') { estado.visibles += 50; return refrescarListaGastos(); }
+    if (a === 'limpiar-busqueda') { estado.busqueda = ''; estado.visibles = 50; return render(); }
+    if (a === 'limpiar-filtros') { estado.busqueda = ''; estado.filtroCat = 'todos'; estado.visibles = 50; return render(); }
   }
 
   const detalle = e.target.closest('[data-detalle]');
@@ -888,5 +1092,16 @@ document.addEventListener('click', (e) => {
 
 window.addEventListener('online', () => avisar('Conexión recuperada. Sincronizando...', 'sync', 3000));
 window.addEventListener('offline', () => avisar('Sin conexión. Los cambios se guardan y se envían después.', 'sync', 0));
+
+// Búsqueda en vivo: actualiza solo la lista de resultados, nunca todo #app,
+// para que el campo de texto no pierda el foco ni el cursor mientras se escribe.
+document.addEventListener('input', (e) => {
+  if (e.target.id !== 'g-busqueda') return;
+  estado.busqueda = e.target.value;
+  estado.visibles = 50;
+  const limpiar = document.getElementById('g-limpiar');
+  if (limpiar) limpiar.hidden = !estado.busqueda;
+  refrescarListaGastos();
+});
 
 render();
