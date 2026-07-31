@@ -158,7 +158,7 @@ textarea.input{min-height:88px;font-family:'IBM Plex Mono',monospace;font-size:1
 .detalle-monto{font-family:'Fraunces',Georgia,serif;font-size:1.6rem;font-weight:600;margin:0 0 .75rem;}
 
 /* ---------- buscador de gastos ---------- */
-.buscador{position:relative;margin-bottom:.7rem;}
+.buscador{position:relative;margin-bottom:1.1rem;}
 .buscador-ico{position:absolute;left:.75rem;top:50%;transform:translateY(-50%);font-size:14px;
   opacity:.55;pointer-events:none;}
 .buscador input{padding-left:2.1rem;padding-right:2.1rem;}
