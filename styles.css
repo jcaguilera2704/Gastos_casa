@@ -5,6 +5,11 @@
   --ink-soft:#5B665D; --ink-faint:#8B9186; --line:#DBDFC9;
   --a:#A8552A; --b:#33587F; --settle:#3F7A56; --danger:#AE4A32;
 }
+:root[data-tema="oscuro"]{
+  --bg:#1A2420; --card:#212C27; --card-alt:#28352F; --ink:#EDEFE6;
+  --ink-soft:#B7C1B7; --ink-faint:#7E8B82; --line:#39463F;
+  --a:#D48453; --b:#6C9BCB; --settle:#6FBB8D; --danger:#E08A70;
+}
 *,*::before,*::after{box-sizing:border-box;}
 html,body{margin:0;padding:0;}
 body{
@@ -50,6 +55,8 @@ body{
 .aviso{margin:0 1.25rem .5rem;padding:.6rem .9rem;border-radius:10px;font-size:.8rem;}
 .aviso.error{background:#F3E3DC;color:var(--danger);border:1px solid #E4BFAF;}
 .aviso.ok{background:#E2EFE6;color:var(--settle);border:1px solid #BEDCC9;}
+:root[data-tema="oscuro"] .aviso.error{background:#3A2A24;border-color:#5A3D33;}
+:root[data-tema="oscuro"] .aviso.ok{background:#20342A;border-color:#345441;}
 .aviso.sync{background:var(--card-alt);color:var(--ink-soft);border:1px solid var(--line);}
 
 main{flex:1;padding:.5rem 1.25rem 1.5rem;}
@@ -115,6 +122,23 @@ h2.seccion{font-family:'Fraunces',Georgia,serif;font-size:1.05rem;font-weight:60
 .leyenda li{display:flex;align-items:center;gap:.5rem;font-size:.8rem;color:var(--ink-soft);}
 .leyenda li b{margin-left:auto;color:var(--ink);font-family:'IBM Plex Mono',monospace;}
 .punto{width:9px;height:9px;border-radius:50%;flex-shrink:0;}
+
+/* ---------- comparar periodos ---------- */
+.delta-sube{color:var(--danger);font-weight:600;}
+.delta-baja{color:var(--settle);font-weight:600;}
+.comparar-lista{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:.7rem;}
+.comparar-fila{display:flex;align-items:center;gap:.5rem;padding-bottom:.6rem;border-bottom:1px dashed var(--line);}
+.comparar-fila:last-child{border-bottom:none;padding-bottom:0;}
+.comparar-cat{flex:1;font-size:.85rem;color:var(--ink-soft);min-width:0;}
+.comparar-montos{display:flex;flex-direction:column;align-items:flex-end;font-family:'IBM Plex Mono',monospace;}
+.comparar-montos b{font-size:.85rem;color:var(--ink);}
+.comparar-anterior{font-size:.68rem;color:var(--ink-faint);}
+.delta{flex-shrink:0;font-size:.72rem;font-weight:600;font-family:'IBM Plex Mono',monospace;
+  padding:.2rem .45rem;border-radius:999px;white-space:nowrap;}
+.delta.delta-sube{background:#F3E3DC;}
+.delta.delta-baja{background:#E2EFE6;}
+:root[data-tema="oscuro"] .delta.delta-sube{background:#3A2A24;}
+:root[data-tema="oscuro"] .delta.delta-baja{background:#20342A;}
 .grafico{display:block;width:100%;height:auto;}
 .barras-labels{display:flex;justify-content:space-between;margin-top:.35rem;font-size:.65rem;color:var(--ink-faint);font-family:'IBM Plex Mono',monospace;}
 
@@ -183,6 +207,7 @@ textarea.input{min-height:88px;font-family:'IBM Plex Mono',monospace;font-size:1
   background:rgba(34,48,43,.78);color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:15px;}
 .foto-quitar:hover{background:var(--ink);}
 .mov-clip{flex-shrink:0;font-size:14px;line-height:1;margin-left:-.25rem;opacity:.7;}
+.mov-sync{flex-shrink:0;font-size:13px;line-height:1;color:var(--ink-faint);opacity:.8;}
 
 .detalle-foto{margin:0 0 1.1rem;}
 .detalle-foto button{display:block;width:100%;padding:0;border:1px solid var(--line);border-radius:12px;
@@ -197,6 +222,16 @@ textarea.input{min-height:88px;font-family:'IBM Plex Mono',monospace;font-size:1
   background:rgba(255,255,255,.16);color:#fff;display:flex;align-items:center;justify-content:center;
   cursor:pointer;font-size:18px;}
 .visor-cerrar:hover{background:rgba(255,255,255,.28);}
+
+/* ---------- deshacer ---------- */
+.deshacer{position:fixed;left:50%;bottom:calc(78px + env(safe-area-inset-bottom));transform:translateX(-50%);
+  z-index:70;background:var(--ink);color:var(--bg);border-radius:12px;padding:.7rem .7rem .7rem 1rem;
+  display:flex;align-items:center;gap:.9rem;box-shadow:0 8px 24px rgba(0,0,0,.25);
+  font-size:.85rem;font-weight:500;max-width:calc(100% - 2.5rem);animation:entrarDeshacer .25s ease both;}
+:root[data-tema="oscuro"] .deshacer{background:var(--card-alt);border:1px solid var(--line);}
+@keyframes entrarDeshacer{from{opacity:0;transform:translate(-50%,10px);}to{opacity:1;transform:translate(-50%,0);}}
+.deshacer button{background:none;border:none;color:inherit;font-weight:700;text-decoration:underline;
+  cursor:pointer;padding:.3rem .2rem;font-size:.85rem;flex-shrink:0;font-family:inherit;}
 
 /* ---------- navegación ---------- */
 nav.tabs{position:sticky;bottom:0;display:flex;background:var(--bg);border-top:1px solid var(--line);
