@@ -27,7 +27,7 @@ const configRef = doc(db, 'config', 'general');
    Constantes
    ============================================================ */
 const CATEGORIAS = [
-  { id: 'mercado',         label: 'Mercado',         ico: '🛒', color: '#7A8B4A' },
+  { id: 'mercado',         label: 'Mercado',         ico: '🛒', color: '#8FB05C' },
   { id: 'restaurantes',    label: 'Restaurantes',    ico: '🍽️', color: '#C0703C' },
   { id: 'bebe',            label: 'Bebé',            ico: '👶', color: '#C2839B' },
   { id: 'salud',           label: 'Salud',           ico: '💊', color: '#A6404A' },
@@ -65,6 +65,39 @@ const esc = (s) => String(s === null || s === undefined ? '' : s)
 const normalizar = (s) => String(s || '')
   .toLowerCase()
   .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+// Propone una categoría mirando qué categoría se usó antes para descripciones parecidas.
+// Es solo una propuesta: la persona la puede cambiar tocando otra categoría, sin que esto
+// se lo impida ni se lo vuelva a imponer después de que ella elija una a mano.
+function sugerirCategoria(texto, excluirId) {
+  const q = normalizar(texto).trim();
+  if (q.length < 3) return null;
+
+  const candidatos = estado.movimientos.filter(m =>
+    m.tipo === 'gasto' && m.id !== excluirId && normalizar(m.descripcion).trim());
+  if (candidatos.length === 0) return null;
+
+  let mejor = null; // { score, frecuencia, categoria }
+  const frecuenciaPorTexto = {}; // normalizado -> { catId: conteo }
+
+  for (const m of candidatos) {
+    const d = normalizar(m.descripcion).trim();
+    let score;
+    if (d === q) score = 3;
+    else if (d.startsWith(q) || q.startsWith(d)) score = 2;
+    else if (d.includes(q) || q.includes(d)) score = 1;
+    else continue;
+
+    frecuenciaPorTexto[d] = frecuenciaPorTexto[d] || {};
+    frecuenciaPorTexto[d][m.categoria] = (frecuenciaPorTexto[d][m.categoria] || 0) + 1;
+    const frecuencia = frecuenciaPorTexto[d][m.categoria];
+
+    if (!mejor || score > mejor.score || (score === mejor.score && frecuencia > mejor.frecuencia)) {
+      mejor = { score, frecuencia, categoria: m.categoria };
+    }
+  }
+  return mejor ? mejor.categoria : null;
+}
 
 // Las fotos viven en su propia colección, no dentro de "movimientos": así la lista de
 // gastos sigue sincronizando liviano y una foto solo se descarga cuando se abre ese gasto.
@@ -220,18 +253,22 @@ function escucharDatos() {
   }, () => {}));
 }
 
-// Si mov trae una foto (dataURL ya comprimida), primero se guarda en la colección
-// "recibos" y solo si eso funciona se marca tieneFoto en el movimiento. Así nunca queda
-// un movimiento que diga tener foto sin que la foto realmente se haya guardado.
-async function guardarMovimiento(mov, foto) {
-  if (foto) {
+// fotoAccion: 'ninguna' (no tocar la foto), 'nueva' (crear o reemplazar), 'quitar' (borrarla).
+// Si mov trae una foto nueva, primero se guarda en la colección "recibos" y solo si eso
+// funciona se marca tieneFoto en el movimiento. Así nunca queda un movimiento que diga
+// tener foto sin que la foto realmente se haya guardado.
+async function guardarMovimiento(mov, fotoAccion = 'ninguna', fotoData = null) {
+  if (fotoAccion === 'nueva' && fotoData) {
     try {
-      await setDoc(recibo(mov.id), { data: foto });
-      estado.fotos[mov.id] = foto;
+      await setDoc(recibo(mov.id), { data: fotoData });
+      estado.fotos[mov.id] = fotoData;
     } catch (e) {
       mov = { ...mov, tieneFoto: false };
       avisar('El gasto se guardó, pero la foto no se pudo subir.', 'error');
     }
+  } else if (fotoAccion === 'quitar') {
+    try { await deleteDoc(recibo(mov.id)); } catch (e) { /* ya no existía */ }
+    delete estado.fotos[mov.id];
   }
   try {
     await setDoc(doc(db, 'movimientos', mov.id), mov);
@@ -576,56 +613,67 @@ const cabezaPanel = (titulo) => `
   <div class="panel-head"><h2>${esc(titulo)}</h2>
     <button class="btn-icono" data-cerrar aria-label="Cerrar">✕</button></div>`;
 
-/* ---------- nuevo gasto ---------- */
-function panelNuevoGasto() {
+/* ---------- nuevo gasto / editar gasto (mismo formulario) ---------- */
+function panelFormularioGasto(existente = null) {
+  const inicial = existente ? {
+    descripcion: existente.descripcion,
+    monto: String(existente.amount),
+    categoria: existente.categoria,
+    fecha: existente.date,
+    pagoQuien: existente.pagoQuien,
+    division: existente.division,
+    pctA: existente.division === 'porcentaje' ? Math.round((existente.parteA / existente.amount) * 100) : 50,
+    soloDe: existente.division === 'solo' ? existente.soloDe : 0,
+  } : {
+    descripcion: '', monto: '', categoria: CATEGORIAS[0].id, fecha: hoyISO(),
+    pagoQuien: 0, division: 'igual', pctA: 50, soloDe: 0,
+  };
+
   abrirPanel(`
     <div class="panel">
-      ${cabezaPanel('Nuevo gasto')}
+      ${cabezaPanel(existente ? 'Editar gasto' : 'Nuevo gasto')}
       <div class="panel-body">
         <label class="campo">Descripción</label>
-        <input class="input" id="g-desc" placeholder="Ej. Mercado de la semana">
+        <input class="input" id="g-desc" placeholder="Ej. Mercado de la semana" value="${esc(inicial.descripcion)}">
+        <p class="sugerencia" id="g-sugerencia" hidden></p>
         <label class="campo">Monto</label>
-        <input class="input mono" id="g-monto" inputmode="numeric" placeholder="0">
-        <p class="preview" id="g-preview"></p>
+        <input class="input mono" id="g-monto" inputmode="numeric" placeholder="0" value="${esc(inicial.monto)}">
+        <p class="preview" id="g-preview">${inicial.monto ? fmt(parseInt(inicial.monto, 10)) : ''}</p>
         <label class="campo">Categoría</label>
         <div class="chips" id="g-cats">
-          ${CATEGORIAS.map((c, i) => `<button class="chip ${i === 0 ? 'activo' : ''}" data-c="${c.id}">${c.ico} ${esc(c.label)}</button>`).join('')}
+          ${CATEGORIAS.map(c => `<button class="chip ${c.id === inicial.categoria ? 'activo' : ''}" data-c="${c.id}">${c.ico} ${esc(c.label)}</button>`).join('')}
         </div>
         <label class="campo">Fecha</label>
-        <input class="input" type="date" id="g-fecha" value="${hoyISO()}" max="${hoyISO()}">
+        <input class="input" type="date" id="g-fecha" value="${inicial.fecha}" max="${hoyISO()}">
         <label class="campo">Pagado por</label>
         <div class="toggles" id="g-pago">
-          ${estado.nombres.map((n, i) => `<button class="toggle ${i === 0 ? 'activo' : ''}" data-p="${i}">${esc(n)}</button>`).join('')}
+          ${estado.nombres.map((n, i) => `<button class="toggle ${i === inicial.pagoQuien ? 'activo' : ''}" data-p="${i}">${esc(n)}</button>`).join('')}
         </div>
         <label class="campo">Cómo dividir</label>
         <div class="toggles" id="g-division">
-          <button class="toggle chico activo" data-d="igual">50 / 50</button>
-          <button class="toggle chico" data-d="porcentaje">Otro %</button>
-          <button class="toggle chico" data-d="solo">Solo uno</button>
+          <button class="toggle chico ${inicial.division === 'igual' ? 'activo' : ''}" data-d="igual">50 / 50</button>
+          <button class="toggle chico ${inicial.division === 'porcentaje' ? 'activo' : ''}" data-d="porcentaje">Otro %</button>
+          <button class="toggle chico ${inicial.division === 'solo' ? 'activo' : ''}" data-d="solo">Solo uno</button>
         </div>
         <div id="g-extra"></div>
 
         <label class="campo">Foto de la factura (opcional)</label>
-        <div id="g-foto">
-          <label class="foto-picker" id="g-foto-boton">
-            📷 Tomar o elegir foto
-            <input type="file" accept="image/*" id="g-foto-input" hidden>
-          </label>
-          <p class="foto-hint">Se reduce antes de guardarse, así que puede verse menos nítida que el original.</p>
-        </div>
+        <div id="g-foto"></div>
 
         <p class="error" id="g-error" hidden></p>
       </div>
       <div class="panel-foot">
-        <button class="btn btn-principal btn-full" id="g-guardar">Guardar gasto</button>
+        <button class="btn btn-principal btn-full" id="g-guardar">${existente ? 'Guardar cambios' : 'Guardar gasto'}</button>
       </div>
     </div>`, (nodo) => {
 
-    const sel = { categoria: CATEGORIAS[0].id, pagoQuien: 0, division: 'igual', pctA: 50, soloDe: 0, foto: null };
+    const sel = { ...inicial, foto: null, fotoEstado: 'ninguna', categoriaManual: !!existente };
     const $ = (s) => nodo.querySelector(s);
 
+    /* --- foto: agregar, o si estamos editando, cargar/quitar/reemplazar la existente --- */
     const zonaFoto = $('#g-foto');
     const pintarFotoVacia = () => {
+      sel.fotoEstado = 'ninguna';
       zonaFoto.innerHTML = `
         <label class="foto-picker" id="g-foto-boton">
           📷 Tomar o elegir foto
@@ -634,9 +682,9 @@ function panelNuevoGasto() {
         <p class="foto-hint">Se reduce antes de guardarse, así que puede verse menos nítida que el original.</p>`;
       zonaFoto.querySelector('#g-foto-input').addEventListener('change', manejarFoto);
     };
-    const pintarFotoTrabajando = () => {
-      sel.fotoTrabajando = true;
-      zonaFoto.innerHTML = `<div class="foto-trabajando"><span class="spinner-sm"></span> Preparando la foto...</div>`;
+    const pintarFotoCargando = (texto) => {
+      sel.fotoEstado = 'cargando';
+      zonaFoto.innerHTML = `<div class="foto-trabajando"><span class="spinner-sm"></span> ${esc(texto)}</div>`;
     };
     const pintarFotoLista = () => {
       zonaFoto.innerHTML = `
@@ -647,18 +695,26 @@ function panelNuevoGasto() {
       zonaFoto.querySelector('#g-foto-quitar').addEventListener('click', () => {
         sel.foto = null;
         pintarFotoVacia();
+        sel.fotoEstado = 'quitada'; // pintarFotoVacia() lo deja en "ninguna"; lo corregimos después
       });
+    };
+    const pintarFotoNoDisponible = () => {
+      sel.fotoEstado = 'no-disponible';
+      zonaFoto.innerHTML = `
+        <p class="foto-hint">La foto guardada ya no está disponible.</p>
+        <label class="foto-picker" id="g-foto-boton">📷 Reemplazar con otra foto
+          <input type="file" accept="image/*" id="g-foto-input" hidden></label>`;
+      zonaFoto.querySelector('#g-foto-input').addEventListener('change', manejarFoto);
     };
     async function manejarFoto(e) {
       const archivo = e.target.files && e.target.files[0];
       if (!archivo) return;
-      pintarFotoTrabajando();
+      pintarFotoCargando('Preparando la foto...');
       try {
         sel.foto = await comprimirImagen(archivo);
-        sel.fotoTrabajando = false;
+        sel.fotoEstado = 'nueva';
         pintarFotoLista();
       } catch (err) {
-        sel.fotoTrabajando = false;
         pintarFotoVacia();
         const err2 = $('#g-error');
         err2.textContent = err.message === 'muy-pesada'
@@ -667,7 +723,30 @@ function panelNuevoGasto() {
         err2.hidden = false;
       }
     }
-    zonaFoto.querySelector('#g-foto-input').addEventListener('change', manejarFoto);
+
+    if (existente && existente.tieneFoto) {
+      pintarFotoCargando('Cargando la foto guardada...');
+      obtenerFoto(existente.id).then((data) => {
+        if (!nodo.isConnected) return;
+        sel.foto = data;
+        sel.fotoEstado = 'existente';
+        pintarFotoLista();
+      }).catch(() => { if (nodo.isConnected) pintarFotoNoDisponible(); });
+    } else {
+      pintarFotoVacia();
+    }
+
+    /* --- sugerencia de categoría mientras se escribe la descripción --- */
+    $('#g-desc').addEventListener('input', (e) => {
+      const sugerencia = $('#g-sugerencia');
+      if (sel.categoriaManual) { sugerencia.hidden = true; return; }
+      const catId = sugerirCategoria(e.target.value, existente ? existente.id : null);
+      if (!catId || catId === sel.categoria) { sugerencia.hidden = true; return; }
+      sel.categoria = catId;
+      nodo.querySelectorAll('#g-cats .chip').forEach(x => x.classList.toggle('activo', x.dataset.c === catId));
+      sugerencia.textContent = `Categoría sugerida según gastos parecidos: ${cat(catId).label}`;
+      sugerencia.hidden = false;
+    });
 
     $('#g-monto').addEventListener('input', (e) => {
       e.target.value = e.target.value.replace(/[^\d]/g, '');
@@ -677,6 +756,8 @@ function panelNuevoGasto() {
     $('#g-cats').addEventListener('click', (e) => {
       const b = e.target.closest('[data-c]'); if (!b) return;
       sel.categoria = b.dataset.c;
+      sel.categoriaManual = true;
+      $('#g-sugerencia').hidden = true;
       nodo.querySelectorAll('#g-cats .chip').forEach(x => x.classList.toggle('activo', x === b));
     });
     $('#g-pago').addEventListener('click', (e) => {
@@ -718,6 +799,7 @@ function panelNuevoGasto() {
         extra.innerHTML = '';
       }
     }
+    pintarExtra(); // por si se abre editando un gasto que ya tenía % o "solo uno"
 
     $('#g-guardar').addEventListener('click', async () => {
       const err = $('#g-error');
@@ -726,23 +808,27 @@ function panelNuevoGasto() {
       const mostrar = (t) => { err.textContent = t; err.hidden = false; };
       if (!descripcion) return mostrar('Escribe una descripción.');
       if (monto <= 0) return mostrar('Ingresa un monto válido.');
-      if (sel.fotoTrabajando) return mostrar('Espera a que termine de prepararse la foto.');
+      if (sel.fotoEstado === 'cargando') return mostrar('Espera a que termine de prepararse la foto.');
 
       let parteA, parteB;
       if (sel.division === 'igual') { parteA = Math.round(monto / 2); parteB = monto - parteA; }
       else if (sel.division === 'porcentaje') { parteA = Math.round(monto * sel.pctA / 100); parteB = monto - parteA; }
       else { parteA = sel.soloDe === 0 ? monto : 0; parteB = monto - parteA; }
 
+      const tieneFotoFinal = sel.fotoEstado === 'nueva' || sel.fotoEstado === 'existente' || sel.fotoEstado === 'no-disponible';
+      const fotoAccion = sel.fotoEstado === 'nueva' ? 'nueva' : sel.fotoEstado === 'quitada' ? 'quitar' : 'ninguna';
+
       const mov = {
-        id: nuevoId(), tipo: 'gasto', date: $('#g-fecha').value || hoyISO(),
+        id: existente ? existente.id : nuevoId(), tipo: 'gasto',
+        date: $('#g-fecha').value || hoyISO(),
         descripcion, amount: monto, categoria: sel.categoria, pagoQuien: sel.pagoQuien,
         division: sel.division, soloDe: sel.division === 'solo' ? sel.soloDe : null,
         parteA, parteB, delta: sel.pagoQuien === 0 ? parteB : -parteA,
-        orden: Date.now(), tieneFoto: !!sel.foto,
+        orden: existente ? existente.orden : Date.now(), tieneFoto: tieneFotoFinal,
       };
       $('#g-guardar').disabled = true;
       cerrarPanel();
-      await guardarMovimiento(mov, sel.foto);
+      await guardarMovimiento(mov, fotoAccion, sel.foto);
     });
   });
 }
@@ -823,12 +909,20 @@ function panelDetalle(id) {
       <div class="panel-body">
         ${cuerpo}
         <div id="d-foto"></div>
+        ${m.tipo === 'gasto' ? `<button class="btn btn-secundario btn-full" id="d-editar" style="margin-bottom:.6rem">Editar</button>` : ''}
         <button class="btn btn-peligro-linea btn-full" id="d-borrar">Eliminar</button>
         <div id="d-confirmar"></div>
       </div>
     </div>`, (nodo) => {
 
     if (m.tieneFoto) cargarFotoDetalle(nodo, id);
+
+    if (m.tipo === 'gasto') {
+      nodo.querySelector('#d-editar').addEventListener('click', () => {
+        cerrarPanel();
+        panelFormularioGasto(m);
+      });
+    }
 
     nodo.querySelector('#d-borrar').addEventListener('click', () => {
       nodo.querySelector('#d-borrar').hidden = true;
@@ -891,6 +985,7 @@ function panelAjustes() {
           Sesión: ${esc(estado.usuario.email || '')}</p>
 
         <button class="btn btn-secundario btn-full" style="margin-top:.7rem" id="a-copia">Copia de seguridad</button>
+        <button class="btn btn-secundario btn-full" style="margin-top:.6rem" id="a-unificar">Unificar nombres parecidos</button>
 
         <div class="zona">
           <p class="campo" style="margin-top:0">Datos</p>
@@ -915,11 +1010,85 @@ function panelAjustes() {
       avisar('Nombres guardados.');
     });
     nodo.querySelector('#a-copia').addEventListener('click', panelCopia);
+    nodo.querySelector('#a-unificar').addEventListener('click', panelUnificarNombres);
     nodo.querySelector('#a-salir').addEventListener('click', async () => {
       cerrarPanel(); await signOut(auth);
     });
 
     prepararImportacion(nodo);
+  });
+}
+
+/* ---------- unificar nombres parecidos ---------- */
+// Solo los grupos revisados a mano: mismo concepto, distinta escritura. Los casos donde
+// el parecido en el texto engañaba (p. ej. "Platos Theo" vs "Zapatos Theo", "Columbia" la
+// marca vs "Colombia" el país) se dejaron fuera a propósito.
+const RENOMBRES = [
+  { canonico: 'Prestamo', variantes: ['Prestamos'] },
+  { canonico: 'Mac Pollo', variantes: ['Mac pollo', 'Macpollo'] },
+  { canonico: 'Burguer Hill', variantes: ['Burguer hill', 'BurguerHill', 'Burguerhill', 'Buguer Hill'] },
+  { canonico: 'Peaje', variantes: ['Peajes'] },
+  { canonico: 'Vacuna Theo', variantes: ['Vacunas theo'] },
+  { canonico: 'Parqueadero aeropuerto', variantes: ['Parqueadero aerop'] },
+  { canonico: 'Piso pélvico', variantes: ['Piso pelvico', 'Piso Pelvico'] },
+  { canonico: 'Hamburguesa', variantes: ['Hamburguesas'] },
+  { canonico: 'Cita Theo', variantes: ['Cita theo'] },
+  { canonico: 'Suzette', variantes: ['Suzzete'] },
+  { canonico: 'Pepe Ganga', variantes: ['Pepe ganga'] },
+  { canonico: 'Administración', variantes: ['Administracion'] },
+  { canonico: 'Jardín Theo', variantes: ['Jardin Theo', 'Jardin theo'] },
+  { canonico: 'Cerveza', variantes: ['Cerveza 2'] },
+  { canonico: 'Açaí', variantes: ['Acai'] },
+  { canonico: 'La Burguer', variantes: ['La burguer'] },
+  { canonico: 'Offcorss', variantes: ['Off corss', 'Offcors'] },
+  { canonico: 'Papa Crunch', variantes: ['Papa crunh'] },
+  { canonico: 'Dollarcity', variantes: ['Dollar city'] },
+  { canonico: 'Lobo Cantina', variantes: ['Lobo cantina'] },
+  { canonico: 'Almuerzo', variantes: ['Almuerzos'] },
+  { canonico: 'Comida Burguer Hill', variantes: ['Comida burguer'] },
+];
+
+function panelUnificarNombres() {
+  const cambios = RENOMBRES
+    .map(r => ({ ...r, afectados: estado.movimientos.filter(m => m.tipo === 'gasto' && r.variantes.includes(m.descripcion)) }))
+    .filter(r => r.afectados.length > 0);
+  const total = cambios.reduce((s, c) => s + c.afectados.length, 0);
+
+  abrirPanel(`
+    <div class="panel">
+      ${cabezaPanel('Unificar nombres parecidos')}
+      <div class="panel-body">
+        ${cambios.length === 0 ? `
+          <p class="pista" style="margin-top:0">No hay nada pendiente por unificar en este momento.</p>
+        ` : `
+          <p class="pista" style="margin-top:0">Esto solo cambia el texto de la descripción — el monto, la
+            categoría, quién pagó y la división quedan exactamente igual. Se puede volver a abrir esta
+            pantalla más adelante si aparecen nuevas variantes.</p>
+          <ul class="detalle-lista" style="margin-top:.9rem">
+            ${cambios.map(c => `<li><span>${esc(c.variantes.join(', '))} → <b>${esc(c.canonico)}</b></span>
+              <b>${c.afectados.length}</b></li>`).join('')}
+          </ul>
+          <p class="pista">${total} gasto${total === 1 ? '' : 's'} en total.</p>
+          <div id="u-zona"></div>
+        `}
+      </div>
+    </div>`, (nodo) => {
+    if (cambios.length === 0) return;
+    const zona = nodo.querySelector('#u-zona');
+    zona.innerHTML = `<button class="btn btn-principal btn-full" id="u-aplicar">Unificar ${total} gasto${total === 1 ? '' : 's'}</button>`;
+    zona.querySelector('#u-aplicar').addEventListener('click', async () => {
+      zona.innerHTML = `<div class="foto-trabajando"><span class="spinner-sm"></span> Aplicando...</div>`;
+      const pares = [];
+      cambios.forEach(c => c.afectados.forEach(m => pares.push({ id: m.id, descripcion: c.canonico })));
+      try {
+        await enLotes(pares, (lote, p) => lote.set(doc(db, 'movimientos', p.id), { descripcion: p.descripcion }, { merge: true }));
+        cerrarPanel();
+        avisar(`Listo: se unificaron ${pares.length} gastos.`);
+      } catch (e) {
+        zona.innerHTML = `<p class="error">No se pudo completar. Revisa tu conexión e intenta de nuevo.</p>
+          <button class="btn btn-principal btn-full" id="u-aplicar">Unificar ${total} gasto${total === 1 ? '' : 's'}</button>`;
+      }
+    });
   });
 }
 
@@ -1067,7 +1236,7 @@ document.addEventListener('click', (e) => {
       return signInWithEmailAndPassword(auth, correo, clave)
         .catch(err => avisar(mensajeAuth(err), 'error', 8000));
     }
-    if (a === 'nuevo') return panelNuevoGasto();
+    if (a === 'nuevo') return panelFormularioGasto();
     if (a === 'saldar') return panelSaldar();
     if (a === 'ajustes') return panelAjustes();
     if (a === 'mas') { estado.visibles += 50; return refrescarListaGastos(); }
