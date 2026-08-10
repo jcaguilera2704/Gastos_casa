@@ -49,6 +49,10 @@ const fmt = (n) => new Intl.NumberFormat('es-CO', {
   style: 'currency', currency: 'COP', maximumFractionDigits: 0
 }).format(Math.round(n || 0));
 
+const fmtDivisa = (n, moneda) => new Intl.NumberFormat('es-CO', {
+  style: 'currency', currency: moneda, maximumFractionDigits: 2
+}).format(n || 0);
+
 const fechaCorta = (iso) => new Intl.DateTimeFormat('es-CO', { day: 'numeric', month: 'short' })
   .format(new Date(iso + 'T00:00:00'));
 
@@ -60,6 +64,17 @@ const hoyISO = () => {
 const nuevoId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const esc = (s) => String(s === null || s === undefined ? '' : s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+/* ---------- modo oscuro ---------- */
+// Preferencia por dispositivo, no por cuenta: cada quien puede tener el suyo distinto.
+function aplicarTema(t) {
+  document.documentElement.dataset.tema = t;
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute('content', t === 'oscuro' ? '#1A2420' : '#22302B');
+  try { localStorage.setItem('gastos-tema', t); } catch (e) { /* modo privado del navegador */ }
+}
+try { aplicarTema(localStorage.getItem('gastos-tema') === 'oscuro' ? 'oscuro' : 'claro'); }
+catch (e) { aplicarTema('claro'); }
 
 // Para que buscar "cafe" también encuentre "Café": pasa a minúsculas y quita tildes.
 const normalizar = (s) => String(s || '')
@@ -73,7 +88,7 @@ function sugerirCategoria(texto, excluirId) {
   const q = normalizar(texto).trim();
   if (q.length < 3) return null;
 
-  const candidatos = estado.movimientos.filter(m =>
+  const candidatos = movimientosVisibles().filter(m =>
     m.tipo === 'gasto' && m.id !== excluirId && normalizar(m.descripcion).trim());
   if (candidatos.length === 0) return null;
 
@@ -150,14 +165,57 @@ const estado = {
   filtroCat: 'todos',
   busqueda: '',
   periodo: 'mes',
+  compararGranularidad: 'mes',
   visibles: 50,
   aviso: null,
   fotos: {}, // cache en memoria: id de movimiento -> foto ya descargada de Firestore
+  pendientesBorrar: new Set(), // ids "eliminados" en la interfaz mientras se puede deshacer
+  tasas: {}, // última tasa de cambio usada por moneda, para prellenar la próxima vez
 };
 
 let desuscribir = [];
+const timersBorrado = {}; // id -> setTimeout, para poder cancelarlo si se deshace
 
-const balance = () => estado.movimientos.reduce((s, m) => s + (m.delta || 0), 0);
+// Lo que realmente se muestra y se cuenta: descarta lo que está en camino a borrarse.
+const movimientosVisibles = () => estado.movimientos.filter(m => !estado.pendientesBorrar.has(m.id));
+
+const balance = () => movimientosVisibles().reduce((s, m) => s + (m.delta || 0), 0);
+
+// Borrado con "deshacer": el gasto desaparece de la vista al toque, pero no se toca
+// Firestore hasta que pasen unos segundos sin que la persona se arrepienta.
+function programarBorrado(m) {
+  estado.pendientesBorrar.add(m.id);
+  render();
+  mostrarDeshacer(m.tipo === 'pago' ? 'Pago' : 'Gasto');
+  timersBorrado[m.id] = setTimeout(async () => {
+    delete timersBorrado[m.id];
+    if (!estado.pendientesBorrar.has(m.id)) return; // ya se deshizo mientras tanto
+    estado.pendientesBorrar.delete(m.id);
+    await borrarMovimiento(m.id, m.tieneFoto);
+  }, 6000);
+}
+function deshacerBorrado() {
+  const id = estado._ultimoBorrado;
+  if (!id) return;
+  if (timersBorrado[id]) { clearTimeout(timersBorrado[id]); delete timersBorrado[id]; }
+  estado.pendientesBorrar.delete(id);
+  ocultarDeshacer();
+  render();
+}
+function mostrarDeshacer(etiqueta) {
+  ocultarDeshacer();
+  estado._ultimoBorrado = [...estado.pendientesBorrar].pop();
+  const nodo = document.createElement('div');
+  nodo.className = 'deshacer';
+  nodo.id = 'deshacer-toast';
+  nodo.innerHTML = `<span>${esc(etiqueta)} eliminado</span><button id="deshacer-btn">Deshacer</button>`;
+  document.body.appendChild(nodo);
+  nodo.querySelector('#deshacer-btn').addEventListener('click', deshacerBorrado);
+}
+function ocultarDeshacer() {
+  const n = document.getElementById('deshacer-toast');
+  if (n) n.remove();
+}
 
 function avisar(texto, tipo = 'ok', ms = 4000) {
   estado.aviso = { texto, tipo };
@@ -225,9 +283,11 @@ function mensajeAuth(e) {
    Datos en tiempo real
    ============================================================ */
 function escucharDatos() {
-  desuscribir.push(onSnapshot(movimientosRef, (snap) => {
-    estado.movimientos = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  desuscribir.push(onSnapshot(movimientosRef, { includeMetadataChanges: true }, (snap) => {
+    estado.movimientos = snap.docs.map(d => ({ id: d.id, ...d.data(), _pendiente: d.metadata.hasPendingWrites }));
     estado.cargando = false;
+    const idsVivos = new Set(estado.movimientos.map(m => m.id));
+    estado.pendientesBorrar.forEach(id => { if (!idsVivos.has(id)) estado.pendientesBorrar.delete(id); });
     // Si en ese momento está escribiendo en el buscador, no reconstruimos toda la
     // pantalla (le quitaría el foco a mitad de la escritura) — solo refrescamos
     // la lista de resultados con los datos nuevos.
@@ -246,10 +306,9 @@ function escucharDatos() {
 
   desuscribir.push(onSnapshot(configRef, (d) => {
     const data = d.data();
-    if (data && Array.isArray(data.nombres) && data.nombres.length === 2) {
-      estado.nombres = data.nombres;
-      render();
-    }
+    if (data && Array.isArray(data.nombres) && data.nombres.length === 2) estado.nombres = data.nombres;
+    if (data && data.tasas && typeof data.tasas === 'object') estado.tasas = data.tasas;
+    if (data) render();
   }, () => {}));
 }
 
@@ -308,6 +367,16 @@ async function guardarNombres(nombres) {
   } catch (e) {
     avisar('No se pudieron guardar los nombres.', 'error');
   }
+}
+
+// Firestore fusiona campos de primer nivel, no submapas: mandamos el objeto de tasas
+// completo (con la nueva incluida) para no perder las otras monedas guardadas antes.
+async function guardarTasa(moneda, tasa) {
+  const tasas = { ...estado.tasas, [moneda]: tasa };
+  estado.tasas = tasas;
+  try {
+    await setDoc(configRef, { tasas }, { merge: true });
+  } catch (e) { /* no es crítico: solo afecta el prellenado la próxima vez */ }
 }
 
 // Firestore acepta máximo 500 operaciones por lote
@@ -388,9 +457,9 @@ function balanzaSVG() {
   const inicial = (n) => (n || '?').trim().charAt(0).toUpperCase();
   return `
   <svg viewBox="0 0 300 175" class="balanza" role="img" aria-label="Balanza de gastos">
-    <polygon points="132,150 168,150 150,110" fill="#22302B" opacity=".85"/>
-    <rect x="118" y="150" width="64" height="7" rx="3.5" fill="#22302B" opacity=".6"/>
-    <line class="pieza" x1="46" y1="${izqY}" x2="254" y2="${derY}" stroke="#22302B" stroke-width="7" stroke-linecap="round"/>
+    <polygon points="132,150 168,150 150,110" fill="var(--ink)" opacity=".85"/>
+    <rect x="118" y="150" width="64" height="7" rx="3.5" fill="var(--ink)" opacity=".6"/>
+    <line class="pieza" x1="46" y1="${izqY}" x2="254" y2="${derY}" stroke="var(--ink)" stroke-width="7" stroke-linecap="round"/>
     <circle class="pieza" cx="46" cy="${izqY - 19}" r="22" fill="#A8552A"/>
     <text class="pieza" x="46" y="${izqY - 19}" text-anchor="middle" dominant-baseline="central">${esc(inicial(estado.nombres[0]))}</text>
     <circle class="pieza" cx="254" cy="${derY - 19}" r="22" fill="#33587F"/>
@@ -402,7 +471,7 @@ function vistaResumen() {
   const b = balance(), abs = Math.abs(b);
   const deudor = b > 0 ? estado.nombres[1] : estado.nombres[0];
   const acreedor = b > 0 ? estado.nombres[0] : estado.nombres[1];
-  const recientes = [...estado.movimientos]
+  const recientes = [...movimientosVisibles()]
     .sort((x, y) => y.date.localeCompare(x.date) || (y.orden - x.orden)).slice(0, 6);
 
   return `
@@ -428,6 +497,8 @@ function vacio() {
 }
 
 function fila(m) {
+  const pendiente = m._pendiente
+    ? '<span class="mov-sync" title="Guardado en este celular, esperando conexión para sincronizar">↻</span>' : '';
   if (m.tipo === 'pago') {
     return `<li><button class="mov" data-detalle="${esc(m.id)}">
       <span class="mov-icono" style="background:#3F7A56;color:#fff">⇄</span>
@@ -435,6 +506,7 @@ function fila(m) {
         <span class="mov-titulo">Pago: ${esc(estado.nombres[m.from])} → ${esc(estado.nombres[m.to])}</span>
         <span class="mov-sub">${esc(fechaCorta(m.date))}</span>
       </span>
+      ${pendiente}
       <span class="mov-monto">${fmt(m.amount)}</span></button></li>`;
   }
   const c = cat(m.categoria);
@@ -448,12 +520,13 @@ function fila(m) {
       <span class="mov-sub">${esc(estado.nombres[m.pagoQuien])} · ${esc(fechaCorta(m.date))} · ${esc(division)}</span>
     </span>
     ${m.tieneFoto ? '<span class="mov-clip" title="Tiene foto">📷</span>' : ''}
+    ${pendiente}
     <span class="mov-monto">${fmt(m.amount)}</span></button></li>`;
 }
 
 /* ---------- gastos ---------- */
 function filtrarGastos() {
-  let lista = estado.movimientos.filter(m => m.tipo === 'gasto');
+  let lista = movimientosVisibles().filter(m => m.tipo === 'gasto');
   if (estado.filtroCat !== 'todos') lista = lista.filter(m => m.categoria === estado.filtroCat);
   const q = normalizar(estado.busqueda.trim());
   if (q) lista = lista.filter(m => normalizar(m.descripcion).includes(q));
@@ -462,7 +535,7 @@ function filtrarGastos() {
 }
 
 function resultadosGastosHTML() {
-  const hayGastos = estado.movimientos.some(m => m.tipo === 'gasto');
+  const hayGastos = movimientosVisibles().some(m => m.tipo === 'gasto');
   const lista = filtrarGastos();
   const visibles = lista.slice(0, estado.visibles);
   const total = lista.reduce((s, m) => s + m.amount, 0);
@@ -525,7 +598,7 @@ function anilloSVG(datos, total) {
                L ${cx + r * Math.cos(a1)} ${cy + r * Math.sin(a1)}
                A ${r} ${r} 0 ${grande} 0 ${cx + r * Math.cos(a0)} ${cy + r * Math.sin(a0)} Z`;
     a0 = a1;
-    return `<path d="${p}" fill="${d.color}" stroke="#FBFBF5" stroke-width="2"/>`;
+    return `<path d="${p}" fill="${d.color}" stroke="var(--card)" stroke-width="2"/>`;
   }).join('');
   return `<svg viewBox="0 0 220 220" class="grafico" style="max-height:220px">${partes}</svg>`;
 }
@@ -545,7 +618,10 @@ function barrasSVG(meses) {
 }
 
 function vistaEstadisticas() {
-  const gastos = estado.movimientos.filter(m => m.tipo === 'gasto');
+  const gastos = movimientosVisibles().filter(m => m.tipo === 'gasto');
+
+  if (estado.periodo === 'comparar') return vistaComparar(gastos);
+
   const ahora = new Date().toISOString();
   const delPeriodo = estado.periodo === 'mes' ? gastos.filter(m => m.date.startsWith(ahora.slice(0, 7)))
     : estado.periodo === 'anio' ? gastos.filter(m => m.date.startsWith(ahora.slice(0, 4)))
@@ -573,6 +649,7 @@ function vistaEstadisticas() {
       <button class="${estado.periodo === 'mes' ? 'activo' : ''}" data-periodo="mes">Mes</button>
       <button class="${estado.periodo === 'anio' ? 'activo' : ''}" data-periodo="anio">Año</button>
       <button class="${estado.periodo === 'todo' ? 'activo' : ''}" data-periodo="todo">Todo</button>
+      <button class="${estado.periodo === 'comparar' ? 'activo' : ''}" data-periodo="comparar">Comparar</button>
     </div>
     <div class="card">
       <p class="card-label">Total ${etiqueta}</p>
@@ -590,6 +667,79 @@ function vistaEstadisticas() {
       <p class="card-nota" style="margin-bottom:.6rem">Promedio: ${fmt(promedio)} por mes</p>
       ${barrasSVG(meses)}
     </div>` : ''}`;
+}
+
+function vistaComparar(gastos) {
+  const g = estado.compararGranularidad; // 'mes' | 'anio'
+  const hoy = new Date();
+  let claveActual, claveAnterior, etiquetaActual, etiquetaAnterior;
+  if (g === 'mes') {
+    claveActual = hoy.toISOString().slice(0, 7);
+    const anterior = new Date(hoy.getFullYear(), hoy.getMonth() - 1, 1);
+    claveAnterior = `${anterior.getFullYear()}-${String(anterior.getMonth() + 1).padStart(2, '0')}`;
+    const fmtMes = (d) => { const t = new Intl.DateTimeFormat('es-CO', { month: 'long', year: 'numeric' }).format(d); return t.charAt(0).toUpperCase() + t.slice(1); };
+    etiquetaActual = fmtMes(hoy);
+    etiquetaAnterior = fmtMes(anterior);
+  } else {
+    claveActual = String(hoy.getFullYear());
+    claveAnterior = String(hoy.getFullYear() - 1);
+    etiquetaActual = claveActual;
+    etiquetaAnterior = claveAnterior;
+  }
+
+  const gActual = gastos.filter(m => m.date.startsWith(claveActual));
+  const gAnterior = gastos.filter(m => m.date.startsWith(claveAnterior));
+  const totalActual = gActual.reduce((s, m) => s + m.amount, 0);
+  const totalAnterior = gAnterior.reduce((s, m) => s + m.amount, 0);
+  const deltaTotalPct = totalAnterior > 0 ? Math.round(((totalActual - totalAnterior) / totalAnterior) * 100) : null;
+
+  const catsActual = {}; gActual.forEach(m => { catsActual[m.categoria] = (catsActual[m.categoria] || 0) + m.amount; });
+  const catsAnterior = {}; gAnterior.forEach(m => { catsAnterior[m.categoria] = (catsAnterior[m.categoria] || 0) + m.amount; });
+  const todas = new Set([...Object.keys(catsActual), ...Object.keys(catsAnterior)]);
+  const filas = [...todas].map(id => {
+    const a = catsActual[id] || 0, b = catsAnterior[id] || 0;
+    return { c: cat(id), actual: a, anterior: b, delta: a - b };
+  }).sort((x, y) => Math.abs(y.delta) - Math.abs(x.delta));
+
+  const flecha = (delta) => delta === 0 ? '' : delta > 0
+    ? `<span class="delta delta-sube">▲ ${fmt(Math.abs(delta))}</span>`
+    : `<span class="delta delta-baja">▼ ${fmt(Math.abs(delta))}</span>`;
+
+  return `
+    <div class="periodo">
+      <button class="activo" data-periodo="comparar">Comparar</button>
+      <button data-periodo="mes">Mes</button>
+      <button data-periodo="anio">Año</button>
+      <button data-periodo="todo">Todo</button>
+    </div>
+    <div class="periodo" style="margin-top:-.4rem">
+      <button class="${g === 'mes' ? 'activo' : ''}" data-granularidad="mes">Por mes</button>
+      <button class="${g === 'anio' ? 'activo' : ''}" data-granularidad="anio">Por año</button>
+    </div>
+    <div class="card">
+      <p class="card-label">${esc(etiquetaActual)} vs. ${esc(etiquetaAnterior)}</p>
+      <p class="card-total">${fmt(totalActual)}</p>
+      <p class="card-nota">
+        ${etiquetaAnterior}: ${fmt(totalAnterior)}
+        ${deltaTotalPct === null ? '' : deltaTotalPct === 0 ? ' · sin cambio'
+          : deltaTotalPct > 0 ? ` · <span class="delta-sube">▲ ${deltaTotalPct}%</span>`
+          : ` · <span class="delta-baja">▼ ${Math.abs(deltaTotalPct)}%</span>`}
+      </p>
+    </div>
+    ${filas.length === 0 ? `<p class="pista" style="text-align:center">No hay gastos en ninguno de los dos períodos.</p>` : `
+    <div class="card">
+      <p class="card-label" style="margin-bottom:.7rem">Por categoría</p>
+      <ul class="comparar-lista">
+        ${filas.map(f => `<li class="comparar-fila">
+          <span class="comparar-cat">${f.c.ico} ${esc(f.c.label)}</span>
+          <span class="comparar-montos">
+            <b>${fmt(f.actual)}</b>
+            <span class="comparar-anterior">antes ${fmt(f.anterior)}</span>
+          </span>
+          ${flecha(f.delta)}
+        </li>`).join('')}
+      </ul>
+    </div>`}`;
 }
 
 /* ============================================================
@@ -615,9 +765,12 @@ const cabezaPanel = (titulo) => `
 
 /* ---------- nuevo gasto / editar gasto (mismo formulario) ---------- */
 function panelFormularioGasto(existente = null) {
+  const esExtranjero = existente && existente.monedaOriginal && existente.monedaOriginal !== 'COP';
   const inicial = existente ? {
     descripcion: existente.descripcion,
-    monto: String(existente.amount),
+    monto: esExtranjero ? String(existente.montoOriginal) : String(existente.amount),
+    moneda: existente.monedaOriginal || 'COP',
+    tasa: existente.tasaUsada || null,
     categoria: existente.categoria,
     fecha: existente.date,
     pagoQuien: existente.pagoQuien,
@@ -625,7 +778,7 @@ function panelFormularioGasto(existente = null) {
     pctA: existente.division === 'porcentaje' ? Math.round((existente.parteA / existente.amount) * 100) : 50,
     soloDe: existente.division === 'solo' ? existente.soloDe : 0,
   } : {
-    descripcion: '', monto: '', categoria: CATEGORIAS[0].id, fecha: hoyISO(),
+    descripcion: '', monto: '', moneda: 'COP', tasa: null, categoria: CATEGORIAS[0].id, fecha: hoyISO(),
     pagoQuien: 0, division: 'igual', pctA: 50, soloDe: 0,
   };
 
@@ -637,8 +790,14 @@ function panelFormularioGasto(existente = null) {
         <input class="input" id="g-desc" placeholder="Ej. Mercado de la semana" value="${esc(inicial.descripcion)}">
         <p class="sugerencia" id="g-sugerencia" hidden></p>
         <label class="campo">Monto</label>
-        <input class="input mono" id="g-monto" inputmode="numeric" placeholder="0" value="${esc(inicial.monto)}">
-        <p class="preview" id="g-preview">${inicial.monto ? fmt(parseInt(inicial.monto, 10)) : ''}</p>
+        <div class="chips" id="g-moneda">
+          <button class="chip ${inicial.moneda === 'COP' ? 'activo' : ''}" data-moneda="COP">🇨🇴 COP</button>
+          <button class="chip ${inicial.moneda === 'USD' ? 'activo' : ''}" data-moneda="USD">🇺🇸 USD</button>
+          <button class="chip ${inicial.moneda === 'EUR' ? 'activo' : ''}" data-moneda="EUR">🇪🇺 EUR</button>
+        </div>
+        <input class="input mono" id="g-monto" inputmode="decimal" placeholder="0" value="${esc(inicial.monto)}">
+        <div id="g-tasa-zona"></div>
+        <p class="preview" id="g-preview"></p>
         <label class="campo">Categoría</label>
         <div class="chips" id="g-cats">
           ${CATEGORIAS.map(c => `<button class="chip ${c.id === inicial.categoria ? 'activo' : ''}" data-c="${c.id}">${c.ico} ${esc(c.label)}</button>`).join('')}
@@ -661,13 +820,14 @@ function panelFormularioGasto(existente = null) {
         <div id="g-foto"></div>
 
         <p class="error" id="g-error" hidden></p>
+        <div id="g-duplicado"></div>
       </div>
       <div class="panel-foot">
         <button class="btn btn-principal btn-full" id="g-guardar">${existente ? 'Guardar cambios' : 'Guardar gasto'}</button>
       </div>
     </div>`, (nodo) => {
 
-    const sel = { ...inicial, foto: null, fotoEstado: 'ninguna', categoriaManual: !!existente };
+    const sel = { ...inicial, foto: null, fotoEstado: 'ninguna', categoriaManual: !!existente, duplicadoConfirmado: false };
     const $ = (s) => nodo.querySelector(s);
 
     /* --- foto: agregar, o si estamos editando, cargar/quitar/reemplazar la existente --- */
@@ -748,9 +908,50 @@ function panelFormularioGasto(existente = null) {
       sugerencia.hidden = false;
     });
 
+    /* --- moneda y monto: COP directo, o divisa extranjera con tasa manual --- */
+    const pintarTasaZona = () => {
+      const zona = $('#g-tasa-zona');
+      if (sel.moneda === 'COP') { zona.innerHTML = ''; return; }
+      const tasaPrefill = sel.tasa || (estado.tasas && estado.tasas[sel.moneda]) || '';
+      zona.innerHTML = `
+        <label class="campo">Tasa de cambio (1 ${sel.moneda} = ? COP)</label>
+        <input class="input mono" id="g-tasa" inputmode="decimal" placeholder="Ej. 4100" value="${esc(String(tasaPrefill))}">`;
+      zona.querySelector('#g-tasa').addEventListener('input', () => actualizarPreview());
+    };
+    const filtrarEntradaMonto = (valor) => {
+      if (sel.moneda === 'COP') return valor.replace(/[^\d]/g, '');
+      let limpio = valor.replace(/[^\d.]/g, '');
+      const partes = limpio.split('.');
+      if (partes.length > 2) limpio = partes[0] + '.' + partes.slice(1).join('');
+      return limpio;
+    };
+    const actualizarPreview = () => {
+      const montoIng = parseFloat($('#g-monto').value) || 0;
+      if (sel.moneda === 'COP') {
+        $('#g-preview').textContent = montoIng ? fmt(montoIng) : '';
+        return;
+      }
+      const tasaEl = $('#g-tasa');
+      const tasaIng = tasaEl ? (parseFloat(tasaEl.value) || 0) : 0;
+      $('#g-preview').textContent = (montoIng && tasaIng)
+        ? `≈ ${fmt(montoIng * tasaIng)} COP (tasa ${tasaIng.toLocaleString('es-CO')})`
+        : montoIng ? 'Falta la tasa de cambio para convertir a pesos.' : '';
+    };
+    pintarTasaZona();
+    actualizarPreview();
+
+    $('#g-moneda').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-moneda]'); if (!b) return;
+      if (b.dataset.moneda === sel.moneda) return;
+      sel.moneda = b.dataset.moneda;
+      $('#g-monto').value = '';
+      nodo.querySelectorAll('#g-moneda .chip').forEach(x => x.classList.toggle('activo', x === b));
+      pintarTasaZona();
+      actualizarPreview();
+    });
     $('#g-monto').addEventListener('input', (e) => {
-      e.target.value = e.target.value.replace(/[^\d]/g, '');
-      $('#g-preview').textContent = e.target.value ? fmt(parseInt(e.target.value, 10)) : '';
+      e.target.value = filtrarEntradaMonto(e.target.value);
+      actualizarPreview();
     });
 
     $('#g-cats').addEventListener('click', (e) => {
@@ -801,14 +1002,45 @@ function panelFormularioGasto(existente = null) {
     }
     pintarExtra(); // por si se abre editando un gasto que ya tenía % o "solo uno"
 
-    $('#g-guardar').addEventListener('click', async () => {
+    async function guardar() {
       const err = $('#g-error');
       const descripcion = $('#g-desc').value.trim();
-      const monto = parseInt($('#g-monto').value, 10) || 0;
+      const montoIngresado = parseFloat($('#g-monto').value) || 0;
+      const moneda = sel.moneda || 'COP';
+      const tasaEl = $('#g-tasa');
+      const tasa = moneda === 'COP' ? null : (tasaEl ? parseFloat(tasaEl.value) || 0 : 0);
+      const fecha = $('#g-fecha').value || hoyISO();
       const mostrar = (t) => { err.textContent = t; err.hidden = false; };
       if (!descripcion) return mostrar('Escribe una descripción.');
-      if (monto <= 0) return mostrar('Ingresa un monto válido.');
+      if (montoIngresado <= 0) return mostrar('Ingresa un monto válido.');
+      if (moneda !== 'COP' && (!tasa || tasa <= 0)) return mostrar('Ingresa la tasa de cambio.');
       if (sel.fotoEstado === 'cargando') return mostrar('Espera a que termine de prepararse la foto.');
+
+      const monto = moneda === 'COP' ? Math.round(montoIngresado) : Math.round(montoIngresado * tasa);
+      if (monto <= 0) return mostrar('Ingresa un monto válido.');
+
+      if (!existente && !sel.duplicadoConfirmado) {
+        const CINCO_MIN = 5 * 60 * 1000;
+        const parecido = movimientosVisibles().find(m => m.tipo === 'gasto' && m.amount === monto &&
+          m.date === fecha && normalizar(m.descripcion) === normalizar(descripcion) &&
+          (Date.now() - (m.orden || 0)) < CINCO_MIN);
+        if (parecido) {
+          $('#g-duplicado').innerHTML = `
+            <p class="error">Ya agregaste "${esc(parecido.descripcion)}" por ${fmt(parecido.amount)} hace un momento.
+              ¿Seguro que quieres agregarlo otra vez?</p>
+            <div class="fila-acciones">
+              <button class="btn btn-secundario" id="g-dup-no">Revisar</button>
+              <button class="btn btn-principal" id="g-dup-si">Agregar de todas formas</button>
+            </div>`;
+          $('#g-duplicado').querySelector('#g-dup-no').addEventListener('click', () => { $('#g-duplicado').innerHTML = ''; });
+          $('#g-duplicado').querySelector('#g-dup-si').addEventListener('click', () => {
+            sel.duplicadoConfirmado = true;
+            $('#g-duplicado').innerHTML = '';
+            guardar();
+          });
+          return;
+        }
+      }
 
       let parteA, parteB;
       if (sel.division === 'igual') { parteA = Math.round(monto / 2); parteB = monto - parteA; }
@@ -819,17 +1051,20 @@ function panelFormularioGasto(existente = null) {
       const fotoAccion = sel.fotoEstado === 'nueva' ? 'nueva' : sel.fotoEstado === 'quitada' ? 'quitar' : 'ninguna';
 
       const mov = {
-        id: existente ? existente.id : nuevoId(), tipo: 'gasto',
-        date: $('#g-fecha').value || hoyISO(),
+        id: existente ? existente.id : nuevoId(), tipo: 'gasto', date: fecha,
         descripcion, amount: monto, categoria: sel.categoria, pagoQuien: sel.pagoQuien,
         division: sel.division, soloDe: sel.division === 'solo' ? sel.soloDe : null,
         parteA, parteB, delta: sel.pagoQuien === 0 ? parteB : -parteA,
         orden: existente ? existente.orden : Date.now(), tieneFoto: tieneFotoFinal,
+        monedaOriginal: moneda, montoOriginal: moneda === 'COP' ? null : montoIngresado,
+        tasaUsada: moneda === 'COP' ? null : tasa,
       };
+      if (moneda !== 'COP') guardarTasa(moneda, tasa);
       $('#g-guardar').disabled = true;
       cerrarPanel();
       await guardarMovimiento(mov, fotoAccion, sel.foto);
-    });
+    }
+    $('#g-guardar').addEventListener('click', guardar);
   });
 }
 
@@ -896,6 +1131,8 @@ function panelDetalle(id) {
       <p class="detalle-titulo">${esc(m.descripcion)}</p>
       <p class="detalle-monto">${fmt(m.amount)}</p>
       <ul class="detalle-lista">
+        ${m.monedaOriginal && m.monedaOriginal !== 'COP' ? `<li><span>Monto original</span>
+          <b>${fmtDivisa(m.montoOriginal, m.monedaOriginal)} · tasa ${fmt(m.tasaUsada)}</b></li>` : ''}
         <li><span>Categoría</span><b>${esc(cat(m.categoria).label)}</b></li>
         <li><span>Pagado por</span><b>${esc(estado.nombres[m.pagoQuien])}</b></li>
         <li><span>Fecha</span><b>${esc(fechaCorta(m.date))}</b></li>
@@ -911,7 +1148,6 @@ function panelDetalle(id) {
         <div id="d-foto"></div>
         ${m.tipo === 'gasto' ? `<button class="btn btn-secundario btn-full" id="d-editar" style="margin-bottom:.6rem">Editar</button>` : ''}
         <button class="btn btn-peligro-linea btn-full" id="d-borrar">Eliminar</button>
-        <div id="d-confirmar"></div>
       </div>
     </div>`, (nodo) => {
 
@@ -925,20 +1161,8 @@ function panelDetalle(id) {
     }
 
     nodo.querySelector('#d-borrar').addEventListener('click', () => {
-      nodo.querySelector('#d-borrar').hidden = true;
-      const zona = nodo.querySelector('#d-confirmar');
-      zona.innerHTML = `<p class="error">¿Eliminar este registro? No se puede deshacer.</p>
-        <div class="fila-acciones">
-          <button class="btn btn-secundario" id="d-no">Cancelar</button>
-          <button class="btn btn-peligro" id="d-si">Sí, eliminar</button>
-        </div>`;
-      zona.querySelector('#d-no').addEventListener('click', () => {
-        zona.innerHTML = ''; nodo.querySelector('#d-borrar').hidden = false;
-      });
-      zona.querySelector('#d-si').addEventListener('click', async () => {
-        cerrarPanel();
-        await borrarMovimiento(id, m.tieneFoto);
-      });
+      cerrarPanel();
+      programarBorrado(m);
     });
   });
 }
@@ -980,6 +1204,12 @@ function panelAjustes() {
         <input class="input" id="a-dos" value="${esc(estado.nombres[1])}">
         <button class="btn btn-secundario btn-full" style="margin-top:.9rem" id="a-nombres">Guardar nombres</button>
 
+        <label class="campo">Apariencia</label>
+        <div class="toggles" id="a-tema">
+          <button class="toggle ${document.documentElement.dataset.tema !== 'oscuro' ? 'activo' : ''}" data-tema="claro">☀️ Claro</button>
+          <button class="toggle ${document.documentElement.dataset.tema === 'oscuro' ? 'activo' : ''}" data-tema="oscuro">🌙 Oscuro</button>
+        </div>
+
         <p class="pista">${estado.movimientos.length} movimientos sincronizados
           · ${estado.movimientos.filter(m => m.tieneFoto).length} con foto.
           Sesión: ${esc(estado.usuario.email || '')}</p>
@@ -1011,6 +1241,11 @@ function panelAjustes() {
     });
     nodo.querySelector('#a-copia').addEventListener('click', panelCopia);
     nodo.querySelector('#a-unificar').addEventListener('click', panelUnificarNombres);
+    nodo.querySelector('#a-tema').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-tema]'); if (!b) return;
+      aplicarTema(b.dataset.tema);
+      nodo.querySelectorAll('#a-tema .toggle').forEach(x => x.classList.toggle('activo', x === b));
+    });
     nodo.querySelector('#a-salir').addEventListener('click', async () => {
       cerrarPanel(); await signOut(auth);
     });
@@ -1050,7 +1285,7 @@ const RENOMBRES = [
 
 function panelUnificarNombres() {
   const cambios = RENOMBRES
-    .map(r => ({ ...r, afectados: estado.movimientos.filter(m => m.tipo === 'gasto' && r.variantes.includes(m.descripcion)) }))
+    .map(r => ({ ...r, afectados: movimientosVisibles().filter(m => m.tipo === 'gasto' && r.variantes.includes(m.descripcion)) }))
     .filter(r => r.afectados.length > 0);
   const total = cambios.reduce((s, c) => s + c.afectados.length, 0);
 
@@ -1166,13 +1401,15 @@ function panelCopia() {
   });
   const comillas = (v) => `"${String(v === null || v === undefined ? '' : v).replace(/"/g, '""')}"`;
   const cabecera = ['Fecha', 'Tipo', 'Descripción', 'Categoría', 'Monto', 'Pagó',
-    `Parte ${estado.nombres[0]}`, `Parte ${estado.nombres[1]}`, 'División'];
+    `Parte ${estado.nombres[0]}`, `Parte ${estado.nombres[1]}`, 'División', 'Moneda original', 'Monto original', 'Tasa'];
   const filas = [...estado.movimientos]
     .sort((a, b) => a.date.localeCompare(b.date) || (a.orden - b.orden))
     .map(m => m.tipo === 'pago'
-      ? [m.date, 'Pago', `${estado.nombres[m.from]} le pagó a ${estado.nombres[m.to]}`, '', m.amount, estado.nombres[m.from], '', '', '']
+      ? [m.date, 'Pago', `${estado.nombres[m.from]} le pagó a ${estado.nombres[m.to]}`, '', m.amount, estado.nombres[m.from], '', '', '', '', '', '']
       : [m.date, 'Gasto', m.descripcion, cat(m.categoria).label, m.amount, estado.nombres[m.pagoQuien],
-         m.parteA, m.parteB, m.division === 'igual' ? '50/50' : m.division === 'solo' ? `Solo ${estado.nombres[m.soloDe]}` : 'Personalizada']);
+         m.parteA, m.parteB, m.division === 'igual' ? '50/50' : m.division === 'solo' ? `Solo ${estado.nombres[m.soloDe]}` : 'Personalizada',
+         m.monedaOriginal && m.monedaOriginal !== 'COP' ? m.monedaOriginal : '',
+         m.montoOriginal || '', m.tasaUsada || '']);
   const csv = '\uFEFF' + [cabecera, ...filas].map(f => f.map(comillas).join(';')).join('\r\n');
   const sello = hoyISO();
 
@@ -1257,6 +1494,9 @@ document.addEventListener('click', (e) => {
 
   const periodo = e.target.closest('[data-periodo]');
   if (periodo) { estado.periodo = periodo.dataset.periodo; return render(); }
+
+  const granularidad = e.target.closest('[data-granularidad]');
+  if (granularidad) { estado.compararGranularidad = granularidad.dataset.granularidad; return render(); }
 });
 
 window.addEventListener('online', () => avisar('Conexión recuperada. Sincronizando...', 'sync', 3000));
