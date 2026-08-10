@@ -137,6 +137,7 @@ label.campo{display:block;font-size:.74rem;font-weight:600;color:var(--ink-soft)
 textarea.input{min-height:88px;font-family:'IBM Plex Mono',monospace;font-size:12px;resize:vertical;}
 .preview{margin:.35rem 0 0;font-size:.8rem;color:var(--ink-faint);}
 .pista{margin:.35rem 0 0;font-size:.72rem;color:var(--ink-faint);line-height:1.4;}
+.sugerencia{margin:.35rem 0 0;font-size:.74rem;color:var(--settle);line-height:1.4;}
 .error{color:var(--danger);font-size:.82rem;margin:.6rem 0 0;}
 .ok{color:var(--settle);font-size:.8rem;margin:.6rem 0 0;line-height:1.4;}
 
